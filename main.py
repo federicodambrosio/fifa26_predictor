@@ -199,8 +199,12 @@ def predict_match_stochastic(
     ground: str,
     host_country: str | None,
     base_goal: float,
+    rng: np.random.Generator | None,
 ) -> dict:
     """Predict one match by sampling from probabilistic outcomes."""
+    if rng is None:
+        rng = np.random.default_rng()
+
     rating1 = rating_points_for(team1, rank_map)
     rating2 = rating_points_for(team2, rank_map)
     rating_diff = rating1 - rating2
@@ -223,19 +227,19 @@ def predict_match_stochastic(
         (-rating_diff / RATING_SCALE) - host_adjustment
     )
 
-    result = np.random.choice(["team1", "draw", "team2"], p=[p_team1, p_draw, p_team2])
+    result = rng.choice(["team1", "draw", "team2"], p=[p_team1, p_draw, p_team2])
 
     if result == "draw":
-        score = max(0, np.random.poisson((expected_goals1 + expected_goals2) / 2.0))
+        score = max(0, rng.poisson((expected_goals1 + expected_goals2) / 2.0))
         team1_goals = team2_goals = int(score)
     elif result == "team1":
-        team1_goals = max(1, int(np.random.poisson(expected_goals1)))
-        team2_goals = max(0, int(np.random.poisson(expected_goals2 * 0.65)))
+        team1_goals = max(1, int(rng.poisson(expected_goals1)))
+        team2_goals = max(0, int(rng.poisson(expected_goals2 * 0.65)))
         if team1_goals <= team2_goals:
             team1_goals = team2_goals + 1
     else:
-        team2_goals = max(1, int(np.random.poisson(expected_goals2)))
-        team1_goals = max(0, int(np.random.poisson(expected_goals1 * 0.65)))
+        team2_goals = max(1, int(rng.poisson(expected_goals2)))
+        team1_goals = max(0, int(rng.poisson(expected_goals1 * 0.65)))
         if team2_goals <= team1_goals:
             team2_goals = team1_goals + 1
 
@@ -260,11 +264,11 @@ def simulate_group_stage(
     matches: pd.DataFrame,
     rank_map: dict[str, float],
     stochastic: bool = False,
-    seed: int | None = None,
+    random_state: np.random.Generator | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Predict every group-stage match and simulate the resulting tables."""
-    if stochastic and seed is not None:
-        np.random.seed(seed)
+    if stochastic and random_state is None:
+        random_state = np.random.default_rng()
 
     historical = pd.read_csv(DATA_DIR / "results.csv", parse_dates=["date"])
     average_goals = (
@@ -274,8 +278,18 @@ def simulate_group_stage(
 
     predictions = []
     for _, row in matches.iterrows():
-        prediction = (
-            predict_match_stochastic(
+        if stochastic:
+            prediction = predict_match_stochastic(
+                row["team1"],
+                row["team2"],
+                rank_map,
+                row.get("ground", ""),
+                row.get("host_country"),
+                base_goal,
+                random_state,
+            )
+        else:
+            prediction = predict_match(
                 row["team1"],
                 row["team2"],
                 rank_map,
@@ -283,16 +297,6 @@ def simulate_group_stage(
                 row.get("host_country"),
                 base_goal,
             )
-            if stochastic
-            else predict_match(
-                row["team1"],
-                row["team2"],
-                rank_map,
-                row.get("ground", ""),
-                row.get("host_country"),
-                base_goal,
-            )
-        )
         prediction["group"] = row["group"]
         prediction["round"] = row["round"]
         predictions.append(prediction)
@@ -362,6 +366,67 @@ def export_match_predictions(predictions: pd.DataFrame, path: Path) -> None:
     sorted_predictions.to_csv(path, index=False)
 
 
+def summarize_monte_carlo(
+    matches: pd.DataFrame,
+    rank_map: dict[str, float],
+    simulations: int,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """Run multiple stochastic simulations and summarize team distribution statistics."""
+    rng = np.random.default_rng(seed)
+    records = []
+
+    for simulation in range(1, simulations + 1):
+        _, grouped = simulate_group_stage(
+            matches, rank_map, stochastic=True, random_state=rng
+        )
+        for group, entries in grouped.groupby("group"):
+            sorted_entries = entries.sort_values(
+                ["points", "goal_difference", "goals_for"],
+                ascending=[False, False, False],
+            )
+            for position, row in enumerate(
+                sorted_entries.itertuples(index=False), start=1
+            ):
+                records.append(
+                    {
+                        "simulation": simulation,
+                        "group": group,
+                        "team": row.team,
+                        "position": position,
+                        "points": row.points,
+                        "goal_difference": row.goal_difference,
+                        "goals_for": row.goals_for,
+                    }
+                )
+
+    all_results = pd.DataFrame.from_records(records)
+    summary = (
+        all_results.groupby(["group", "team"], as_index=False)
+        .agg(
+            simulations=("position", "size"),
+            first_count=("position", lambda x: (x == 1).sum()),
+            second_count=("position", lambda x: (x == 2).sum()),
+            third_count=("position", lambda x: (x == 3).sum()),
+            fourth_count=("position", lambda x: (x == 4).sum()),
+            avg_points=("points", "mean"),
+            avg_goal_difference=("goal_difference", "mean"),
+            avg_goals_for=("goals_for", "mean"),
+        )
+        .assign(
+            prob_first=lambda df: df["first_count"] / simulations,
+            prob_second=lambda df: df["second_count"] / simulations,
+            prob_third=lambda df: df["third_count"] / simulations,
+            prob_fourth=lambda df: df["fourth_count"] / simulations,
+            prob_top2=lambda df: (df["first_count"] + df["second_count"]) / simulations,
+        )
+    )
+
+    return summary.sort_values(
+        ["group", "prob_top2", "prob_first"], ascending=[True, False, False]
+    )
+
+
 def print_group_predictions(grouped: pd.DataFrame) -> None:
     """Print group table predictions in readable format."""
     for group, entries in grouped.groupby("group"):
@@ -376,48 +441,78 @@ def print_group_predictions(grouped: pd.DataFrame) -> None:
 def main() -> None:
     """Run the group-stage prediction pipeline and print results."""
     parser = argparse.ArgumentParser(
-        description="Predict 2026 World Cup group-stage results deterministically or stochastically."
+        description=(
+            "Predict 2026 World Cup group-stage results deterministically, "
+            "stochastically, or with Monte Carlo simulations."
+        )
     )
     parser.add_argument(
         "--mode",
-        choices=["deterministic", "stochastic"],
+        choices=["deterministic", "stochastic", "montecarlo"],
         default="deterministic",
-        help="Choose deterministic or stochastic prediction mode.",
+        help="Choose deterministic, stochastic, or Monte Carlo simulation mode.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Random seed for stochastic predictions.",
+        help="Random seed for stochastic predictions and Monte Carlo simulations.",
+    )
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=1000,
+        help="Number of Monte Carlo simulations when mode is montecarlo.",
     )
     args = parser.parse_args()
 
     rankings = load_rankings()
     rank_map = build_rank_map(rankings)
     matches = load_group_matches()
-    predictions, group_table = simulate_group_stage(
-        matches,
-        rank_map,
-        stochastic=args.mode == "stochastic",
-        seed=args.seed,
-    )
 
-    csv_path = (
-        Path(__file__).resolve().parent
-        / f"predicted_group_stage_matches_{args.mode}.csv"
-    )
-    export_match_predictions(predictions, csv_path)
-    print(f"Wrote all match predictions to {csv_path}")
-
-    print("\nPredicted group standings")
-    print_group_predictions(group_table)
-
-    print("\nSample match predictions")
-    for _, row in predictions.sort_values(["group", "round"]).head(12).iterrows():
-        print(
-            f"{row['group']} {row['round']}: {row['team1']} {row['team1_goals']}-{row['team2_goals']} {row['team2']} "
-            f"(P1={row['prob_team1']:.2f}, D={row['prob_draw']:.2f}, P2={row['prob_team2']:.2f})"
+    if args.mode == "montecarlo":
+        summary = summarize_monte_carlo(
+            matches, rank_map, args.simulations, seed=args.seed
         )
+        csv_path = Path(__file__).resolve().parent / "montecarlo_group_distribution.csv"
+        summary.to_csv(csv_path, index=False)
+        print(f"Wrote Monte Carlo summary to {csv_path}")
+        print(f"Ran {args.simulations} Monte Carlo simulations")
+        for group, entries in summary.groupby("group"):
+            print(f"\n{group}")
+            for row in (
+                entries.sort_values("prob_top2", ascending=False).head(4).itertuples()
+            ):
+                print(
+                    f"{row.team}: top2={row.prob_top2:.3f}, first={row.prob_first:.3f}, "
+                    f"avg_pts={row.avg_points:.2f}, avg_gd={row.avg_goal_difference:.2f}"
+                )
+    else:
+        predictions, group_table = simulate_group_stage(
+            matches,
+            rank_map,
+            stochastic=args.mode == "stochastic",
+            random_state=(
+                np.random.default_rng(args.seed) if args.seed is not None else None
+            ),
+        )
+
+        csv_path = (
+            Path(__file__).resolve().parent
+            / f"predicted_group_stage_matches_{args.mode}.csv"
+        )
+        export_match_predictions(predictions, csv_path)
+        print(f"Wrote all match predictions to {csv_path}")
+
+        print("\nPredicted group standings")
+        print_group_predictions(group_table)
+
+        print("\nSample match predictions")
+        for _, row in predictions.sort_values(["group", "round"]).head(12).iterrows():
+            print(
+                f"{row['group']} {row['round']}: {row['team1']} {row['team1_goals']}-{row['team2_goals']} {row['team2']} "
+                f"(P1={row['prob_team1']:.2f}, D={row['prob_draw']:.2f}, P2={row['prob_team2']:.2f})"
+            )
 
 
 if __name__ == "__main__":
