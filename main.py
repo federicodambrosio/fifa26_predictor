@@ -65,6 +65,8 @@ DRAW_BASE = 0.18
 DRAW_DECAY = 0.12
 GOAL_SCALING_FACTOR = 1.47
 HOME_ADVANTAGE = 0.08
+HISTORICAL_HOME_GOAL_ADJUSTMENT = 0.18
+HISTORY_STRENGTH_SCALE = 100.0
 
 
 def normalize_team_name(team: str) -> str:
@@ -103,6 +105,7 @@ def load_group_matches(path: Path | str = DATA_DIR / "worldcup.json") -> pd.Data
         payload = json.load(handle)
 
     matches = pd.DataFrame(payload["matches"])
+    matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
     matches = matches[matches["round"].str.contains("Matchday", na=False)].copy()
     matches["host_country"] = matches["ground"].apply(infer_host_country)
     return matches
@@ -127,6 +130,99 @@ def rating_points_for(team: str, rank_map: dict[str, float]) -> float:
     return DEFAULT_RANK_POINTS
 
 
+def tournament_importance_weight(tournament: str) -> float:
+    """Return a relative importance weight for a historical tournament."""
+    normalized = str(tournament).strip().lower()
+    if "world cup" in normalized and "qualif" not in normalized:
+        return 2.0
+    if "friendly" in normalized:
+        return 0.7
+    if "qualif" in normalized or "qualification" in normalized:
+        return 1.1
+    if "cup" in normalized or "championship" in normalized:
+        return 1.2
+    return 1.0
+
+
+def match_recency_weight(
+    match_date: pd.Timestamp, reference_date: pd.Timestamp
+) -> float:
+    """Weight recent matches higher, decaying rapidly around 4 years and zero after 15 years."""
+    if pd.isna(match_date):
+        return 0.0
+
+    age_years = float((reference_date - match_date).days) / 365.25
+    if age_years <= 0.0:
+        return 1.0
+    if age_years >= 15.0:
+        return 0.0
+    return float(np.exp(-age_years / 4.0))
+
+
+def ranking_similarity_weight(
+    team1: str, team2: str, rank_map: dict[str, float]
+) -> float:
+    """Weight matches between similarly ranked teams higher."""
+    diff = abs(rating_points_for(team1, rank_map) - rating_points_for(team2, rank_map))
+    return float(np.exp(-diff / 200.0))
+
+
+def historical_match_weight(
+    row: pd.Series, rank_map: dict[str, float], reference_date: pd.Timestamp
+) -> float:
+    """Compute a combined weight for a historical match."""
+    return (
+        tournament_importance_weight(row["tournament"])
+        * match_recency_weight(row["date"], reference_date)
+        * ranking_similarity_weight(row["home_team"], row["away_team"], rank_map)
+    )
+
+
+def build_historical_team_strengths(
+    historical: pd.DataFrame, rank_map: dict[str, float], reference_date: pd.Timestamp
+) -> dict[str, float]:
+    """Build weighted team strength offsets from historical international results."""
+    historical = historical.copy()
+    historical["weight"] = historical.apply(
+        lambda row: historical_match_weight(row, rank_map, reference_date), axis=1
+    )
+
+    records: list[dict[str, float]] = []
+    for _, row in historical.iterrows():
+        home_diff = float(row["home_score"] - row["away_score"])
+        away_diff = float(row["away_score"] - row["home_score"])
+        records.append(
+            {
+                "team": row["home_team"],
+                "weighted_diff": (home_diff - HISTORICAL_HOME_GOAL_ADJUSTMENT)
+                * row["weight"],
+                "weight": row["weight"],
+            }
+        )
+        records.append(
+            {
+                "team": row["away_team"],
+                "weighted_diff": (away_diff + HISTORICAL_HOME_GOAL_ADJUSTMENT)
+                * row["weight"],
+                "weight": row["weight"],
+            }
+        )
+
+    strength_frame = pd.DataFrame.from_records(records)
+    if strength_frame.empty:
+        return {}
+
+    grouped = strength_frame.groupby("team", as_index=False).agg(
+        total_diff=("weighted_diff", "sum"),
+        total_weight=("weight", "sum"),
+    )
+    grouped["strength"] = grouped["total_diff"] / grouped["total_weight"].clip(
+        lower=1e-8
+    )
+    strengths = grouped.set_index("team")["strength"].astype(float).to_dict()
+    return {str(team): float(value) for team, value in strengths.items()}
+
+
 def predict_match(
     team1: str,
     team2: str,
@@ -134,11 +230,20 @@ def predict_match(
     ground: str,
     host_country: str | None,
     base_goal: float,
+    historical_strength: dict[str, float] | None = None,
 ) -> dict:
     """Predict the scoreline and outcome probabilities for one match."""
     rating1 = rating_points_for(team1, rank_map)
     rating2 = rating_points_for(team2, rank_map)
     rating_diff = rating1 - rating2
+
+    history_diff = 0.0
+    if historical_strength is not None:
+        history_diff = historical_strength.get(team1, 0.0) - historical_strength.get(
+            team2, 0.0
+        )
+
+    adjusted_diff = rating_diff + history_diff * HISTORY_STRENGTH_SCALE
 
     host_adjustment = 0.0
     if host_country is not None:
@@ -147,15 +252,17 @@ def predict_match(
         elif team2 == host_country:
             host_adjustment = -HOME_ADVANTAGE
 
-    p_draw = DRAW_BASE + DRAW_DECAY * np.exp(-abs(rating_diff) / 200.0)
+    p_draw = DRAW_BASE + DRAW_DECAY * np.exp(-abs(adjusted_diff) / 200.0)
     p_draw = float(np.clip(p_draw, 0.08, 0.40))
-    raw_win = 1.0 / (1.0 + 10.0 ** (-rating_diff / 300.0))
+    raw_win = 1.0 / (1.0 + 10.0 ** (-adjusted_diff / 300.0))
     p_team1 = (1.0 - p_draw) * raw_win
     p_team2 = (1.0 - p_draw) * (1.0 - raw_win)
 
-    expected_goals1 = base_goal * np.exp((rating_diff / RATING_SCALE) + host_adjustment)
+    expected_goals1 = base_goal * np.exp(
+        (adjusted_diff / RATING_SCALE) + host_adjustment
+    )
     expected_goals2 = base_goal * np.exp(
-        (-rating_diff / RATING_SCALE) - host_adjustment
+        (-adjusted_diff / RATING_SCALE) - host_adjustment
     )
 
     if p_draw >= 0.30:
@@ -200,6 +307,7 @@ def predict_match_stochastic(
     host_country: str | None,
     base_goal: float,
     rng: np.random.Generator | None,
+    historical_strength: dict[str, float] | None = None,
 ) -> dict:
     """Predict one match by sampling from probabilistic outcomes."""
     if rng is None:
@@ -209,6 +317,14 @@ def predict_match_stochastic(
     rating2 = rating_points_for(team2, rank_map)
     rating_diff = rating1 - rating2
 
+    history_diff = 0.0
+    if historical_strength is not None:
+        history_diff = historical_strength.get(team1, 0.0) - historical_strength.get(
+            team2, 0.0
+        )
+
+    adjusted_diff = rating_diff + history_diff * HISTORY_STRENGTH_SCALE
+
     host_adjustment = 0.0
     if host_country is not None:
         if team1 == host_country:
@@ -216,15 +332,17 @@ def predict_match_stochastic(
         elif team2 == host_country:
             host_adjustment = -HOME_ADVANTAGE
 
-    p_draw = DRAW_BASE + DRAW_DECAY * np.exp(-abs(rating_diff) / 200.0)
+    p_draw = DRAW_BASE + DRAW_DECAY * np.exp(-abs(adjusted_diff) / 200.0)
     p_draw = float(np.clip(p_draw, 0.08, 0.40))
-    raw_win = 1.0 / (1.0 + 10.0 ** (-rating_diff / 300.0))
+    raw_win = 1.0 / (1.0 + 10.0 ** (-adjusted_diff / 300.0))
     p_team1 = (1.0 - p_draw) * raw_win
     p_team2 = (1.0 - p_draw) * (1.0 - raw_win)
 
-    expected_goals1 = base_goal * np.exp((rating_diff / RATING_SCALE) + host_adjustment)
+    expected_goals1 = base_goal * np.exp(
+        (adjusted_diff / RATING_SCALE) + host_adjustment
+    )
     expected_goals2 = base_goal * np.exp(
-        (-rating_diff / RATING_SCALE) - host_adjustment
+        (-adjusted_diff / RATING_SCALE) - host_adjustment
     )
 
     result = rng.choice(["team1", "draw", "team2"], p=[p_team1, p_draw, p_team2])
@@ -271,9 +389,27 @@ def simulate_group_stage(
         random_state = np.random.default_rng()
 
     historical = pd.read_csv(DATA_DIR / "results.csv", parse_dates=["date"])
-    average_goals = (
-        historical["home_score"].mean() + historical["away_score"].mean()
-    ) / 2.0
+    reference_date = (
+        matches["date"].max()
+        if "date" in matches.columns and pd.notna(matches["date"].max())
+        else pd.Timestamp("2026-06-01")
+    )
+    historical["weight"] = historical.apply(
+        lambda row: historical_match_weight(row, rank_map, reference_date), axis=1
+    )
+    historical_strength = build_historical_team_strengths(
+        historical, rank_map, reference_date
+    )
+    total_weight = historical["weight"].sum()
+    if total_weight > 0.0:
+        average_goals = (
+            (historical["home_score"] + historical["away_score"]) / 2.0
+        ).mul(historical["weight"]).sum() / total_weight
+    else:
+        average_goals = (
+            historical["home_score"].mean() + historical["away_score"].mean()
+        ) / 2.0
+
     base_goal = float(np.clip(average_goals, 1.20, 1.70))
 
     predictions = []
@@ -287,6 +423,7 @@ def simulate_group_stage(
                 row.get("host_country"),
                 base_goal,
                 random_state,
+                historical_strength,
             )
         else:
             prediction = predict_match(
@@ -296,6 +433,7 @@ def simulate_group_stage(
                 row.get("ground", ""),
                 row.get("host_country"),
                 base_goal,
+                historical_strength,
             )
         prediction["group"] = row["group"]
         prediction["round"] = row["round"]

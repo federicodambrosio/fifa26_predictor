@@ -6,7 +6,7 @@ Build a match-level predictive model from the 2026 World Cup group stage schedul
 1. Define the prediction target: match result (win/draw/loss) and scoreline.
 2. Load data from `data/worldcup.json`, `data/rankings.json`, and `data/results.csv`.
 3. Normalize team names across datasets using the existing mapping logic in `exploration.ipynb` and extend it for any unmatched teams.
-4. Build a training dataset from historical results: pair each match with team features at the match date.
+4. Build a training dataset from historical results: pair each match with team features at the match date. Give more weight to recent matches and those between similarly ranked teams. Weight should be zero after 15 years. World cup matches should be weighted more than friendlies.
 5. Engineer features such as ranking points, ranking difference, recent form, goal averages, confederation pair, and match context
 6. Choose a model approach:
    - Poisson goal model for predicted scores, or
