@@ -1,0 +1,45 @@
+[project]
+name = "fifa26"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "ruff>=0.15.16",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # Pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "C4",    # flake8-comprehensions
+    "PIE",   # flake8-pie
+    "SIM",   # flake8-simplify
+    "D",     # pydocstyle (docstrings)
+    "RUF",   # Ruff-specific rules
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "E203",  # whitespace before ':'
+    "D100",  # missing module docstring
+    "D104",  # missing package docstring
+    "D105",  # missing magic method docstring
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E402"]  # module level import not at top of file (notebooks)
+"__init__.py" = ["F401"]  # unused imports (for exports)
