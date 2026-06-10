@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -191,10 +192,80 @@ def predict_match(
     }
 
 
+def predict_match_stochastic(
+    team1: str,
+    team2: str,
+    rank_map: dict[str, float],
+    ground: str,
+    host_country: str | None,
+    base_goal: float,
+) -> dict:
+    """Predict one match by sampling from probabilistic outcomes."""
+    rating1 = rating_points_for(team1, rank_map)
+    rating2 = rating_points_for(team2, rank_map)
+    rating_diff = rating1 - rating2
+
+    host_adjustment = 0.0
+    if host_country is not None:
+        if team1 == host_country:
+            host_adjustment = HOME_ADVANTAGE
+        elif team2 == host_country:
+            host_adjustment = -HOME_ADVANTAGE
+
+    p_draw = DRAW_BASE + DRAW_DECAY * np.exp(-abs(rating_diff) / 200.0)
+    p_draw = float(np.clip(p_draw, 0.08, 0.40))
+    raw_win = 1.0 / (1.0 + 10.0 ** (-rating_diff / 300.0))
+    p_team1 = (1.0 - p_draw) * raw_win
+    p_team2 = (1.0 - p_draw) * (1.0 - raw_win)
+
+    expected_goals1 = base_goal * np.exp((rating_diff / RATING_SCALE) + host_adjustment)
+    expected_goals2 = base_goal * np.exp(
+        (-rating_diff / RATING_SCALE) - host_adjustment
+    )
+
+    result = np.random.choice(["team1", "draw", "team2"], p=[p_team1, p_draw, p_team2])
+
+    if result == "draw":
+        score = max(0, np.random.poisson((expected_goals1 + expected_goals2) / 2.0))
+        team1_goals = team2_goals = int(score)
+    elif result == "team1":
+        team1_goals = max(1, int(np.random.poisson(expected_goals1)))
+        team2_goals = max(0, int(np.random.poisson(expected_goals2 * 0.65)))
+        if team1_goals <= team2_goals:
+            team1_goals = team2_goals + 1
+    else:
+        team2_goals = max(1, int(np.random.poisson(expected_goals2)))
+        team1_goals = max(0, int(np.random.poisson(expected_goals1 * 0.65)))
+        if team2_goals <= team1_goals:
+            team2_goals = team1_goals + 1
+
+    return {
+        "team1": team1,
+        "team2": team2,
+        "group": None,
+        "ground": ground,
+        "team1_goals": int(team1_goals),
+        "team2_goals": int(team2_goals),
+        "prob_team1": float(p_team1),
+        "prob_draw": float(p_draw),
+        "prob_team2": float(p_team2),
+        "result": result,
+        "rating1": float(rating1),
+        "rating2": float(rating2),
+        "host_country": host_country,
+    }
+
+
 def simulate_group_stage(
-    matches: pd.DataFrame, rank_map: dict[str, float]
+    matches: pd.DataFrame,
+    rank_map: dict[str, float],
+    stochastic: bool = False,
+    seed: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Predict every group-stage match and simulate the resulting tables."""
+    if stochastic and seed is not None:
+        np.random.seed(seed)
+
     historical = pd.read_csv(DATA_DIR / "results.csv", parse_dates=["date"])
     average_goals = (
         historical["home_score"].mean() + historical["away_score"].mean()
@@ -203,13 +274,24 @@ def simulate_group_stage(
 
     predictions = []
     for _, row in matches.iterrows():
-        prediction = predict_match(
-            row["team1"],
-            row["team2"],
-            rank_map,
-            row.get("ground", ""),
-            row.get("host_country"),
-            base_goal,
+        prediction = (
+            predict_match_stochastic(
+                row["team1"],
+                row["team2"],
+                rank_map,
+                row.get("ground", ""),
+                row.get("host_country"),
+                base_goal,
+            )
+            if stochastic
+            else predict_match(
+                row["team1"],
+                row["team2"],
+                rank_map,
+                row.get("ground", ""),
+                row.get("host_country"),
+                base_goal,
+            )
         )
         prediction["group"] = row["group"]
         prediction["round"] = row["round"]
@@ -293,12 +375,37 @@ def print_group_predictions(grouped: pd.DataFrame) -> None:
 
 def main() -> None:
     """Run the group-stage prediction pipeline and print results."""
+    parser = argparse.ArgumentParser(
+        description="Predict 2026 World Cup group-stage results deterministically or stochastically."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["deterministic", "stochastic"],
+        default="deterministic",
+        help="Choose deterministic or stochastic prediction mode.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for stochastic predictions.",
+    )
+    args = parser.parse_args()
+
     rankings = load_rankings()
     rank_map = build_rank_map(rankings)
     matches = load_group_matches()
-    predictions, group_table = simulate_group_stage(matches, rank_map)
+    predictions, group_table = simulate_group_stage(
+        matches,
+        rank_map,
+        stochastic=args.mode == "stochastic",
+        seed=args.seed,
+    )
 
-    csv_path = Path(__file__).resolve().parent / "predicted_group_stage_matches.csv"
+    csv_path = (
+        Path(__file__).resolve().parent
+        / f"predicted_group_stage_matches_{args.mode}.csv"
+    )
     export_match_predictions(predictions, csv_path)
     print(f"Wrote all match predictions to {csv_path}")
 
