@@ -223,6 +223,118 @@ def build_historical_team_strengths(
     return {str(team): float(value) for team, value in strengths.items()}
 
 
+def compute_weighted_average_goals(
+    historical: pd.DataFrame,
+    rank_map: dict[str, float],
+    reference_date: pd.Timestamp,
+) -> float:
+    """Compute the weighted average goals per team from historical matches."""
+    if historical.empty:
+        return 1.45
+
+    weighted = historical.copy()
+    weighted["weight"] = weighted.apply(
+        lambda row: historical_match_weight(row, rank_map, reference_date), axis=1
+    )
+    total_weight = weighted["weight"].sum()
+    if total_weight > 0.0:
+        average_goals = ((weighted["home_score"] + weighted["away_score"]) / 2.0).mul(
+            weighted["weight"]
+        ).sum() / total_weight
+    else:
+        average_goals = (
+            weighted["home_score"].mean() + weighted["away_score"].mean()
+        ) / 2.0
+
+    return float(np.clip(average_goals, 1.20, 1.70))
+
+
+def backtest_last_year(
+    rank_map: dict[str, float],
+    days: int = 365,
+    reference_date: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Backtest the model on the most recent year of international matches."""
+    historical = pd.read_csv(DATA_DIR / "results.csv", parse_dates=["date"])
+    if historical.empty:
+        raise ValueError("Historical results are empty; cannot run backtest.")
+
+    if reference_date is None:
+        reference_date = historical["date"].max()
+    if pd.isna(reference_date):
+        raise ValueError("Historical results contain no valid dates.")
+
+    cutoff_date = reference_date - pd.Timedelta(days=days)
+    training = historical[historical["date"] < cutoff_date].copy()
+    test = historical[historical["date"] >= cutoff_date].copy()
+
+    if training.empty:
+        training = historical[historical["date"] < reference_date].copy()
+
+    test = test.dropna(subset=["home_score", "away_score", "home_team", "away_team"])
+    if test.empty:
+        raise ValueError("No complete matches found in the last year for backtesting.")
+
+    historical_strength = build_historical_team_strengths(
+        training, rank_map, reference_date
+    )
+    base_goal = compute_weighted_average_goals(training, rank_map, reference_date)
+
+    rows = []
+    for _, row in test.iterrows():
+        host_country = (
+            None if bool(row.get("neutral", False)) else str(row.get("country", ""))
+        )
+        prediction = predict_match(
+            row["home_team"],
+            row["away_team"],
+            rank_map,
+            "",
+            host_country,
+            base_goal,
+            historical_strength,
+        )
+        actual_result = (
+            "team1"
+            if float(row["home_score"]) > float(row["away_score"])
+            else "team2"
+            if float(row["home_score"]) < float(row["away_score"])
+            else "draw"
+        )
+        goal_diff_error = abs(
+            (prediction["team1_goals"] - prediction["team2_goals"])
+            - (float(row["home_score"]) - float(row["away_score"]))
+        )
+        rows.append(
+            {
+                "date": row["date"],
+                "home_team": row["home_team"],
+                "away_team": row["away_team"],
+                "home_score": int(row["home_score"]),
+                "away_score": int(row["away_score"]),
+                "predicted_home_goals": prediction["team1_goals"],
+                "predicted_away_goals": prediction["team2_goals"],
+                "predicted_result": prediction["result"],
+                "actual_result": actual_result,
+                "correct_outcome": prediction["result"] == actual_result,
+                "exact_score": (
+                    prediction["team1_goals"] == int(row["home_score"])
+                    and prediction["team2_goals"] == int(row["away_score"])
+                ),
+                "goal_diff_error": float(goal_diff_error),
+            }
+        )
+
+    results = pd.DataFrame.from_records(rows)
+    metrics = {
+        "matches": len(results),
+        "outcome_accuracy": float(results["correct_outcome"].mean()),
+        "exact_score_accuracy": float(results["exact_score"].mean()),
+        "mean_absolute_goal_diff_error": float(results["goal_diff_error"].mean()),
+    }
+    return results, metrics
+
+
 def predict_match(
     team1: str,
     team2: str,
@@ -400,17 +512,7 @@ def simulate_group_stage(
     historical_strength = build_historical_team_strengths(
         historical, rank_map, reference_date
     )
-    total_weight = historical["weight"].sum()
-    if total_weight > 0.0:
-        average_goals = (
-            (historical["home_score"] + historical["away_score"]) / 2.0
-        ).mul(historical["weight"]).sum() / total_weight
-    else:
-        average_goals = (
-            historical["home_score"].mean() + historical["away_score"].mean()
-        ) / 2.0
-
-    base_goal = float(np.clip(average_goals, 1.20, 1.70))
+    base_goal = compute_weighted_average_goals(historical, rank_map, reference_date)
 
     predictions = []
     for _, row in matches.iterrows():
@@ -586,9 +688,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["deterministic", "stochastic", "montecarlo"],
+        choices=["deterministic", "stochastic", "montecarlo", "backtest"],
         default="deterministic",
-        help="Choose deterministic, stochastic, or Monte Carlo simulation mode.",
+        help="Choose deterministic, stochastic, Monte Carlo, or backtest mode.",
     )
     parser.add_argument(
         "--seed",
@@ -625,6 +727,25 @@ def main() -> None:
                     f"{row.team}: top2={row.prob_top2:.3f}, first={row.prob_first:.3f}, "
                     f"avg_pts={row.avg_points:.2f}, avg_gd={row.avg_goal_difference:.2f}"
                 )
+    elif args.mode == "backtest":
+        results, metrics = backtest_last_year(rank_map)
+        csv_path = Path(__file__).resolve().parent / "backtest_last_year_results.csv"
+        results.to_csv(csv_path, index=False)
+        print(f"Wrote backtest results to {csv_path}")
+        print("\nBacktest metrics")
+        print(f"Matches: {metrics['matches']}")
+        print(f"Outcome accuracy: {metrics['outcome_accuracy']:.3f}")
+        print(f"Exact score accuracy: {metrics['exact_score_accuracy']:.3f}")
+        print(
+            f"Mean absolute goal difference error: {metrics['mean_absolute_goal_diff_error']:.3f}"
+        )
+        print("\nSample backtest rows")
+        for _, row in results.sort_values(["date"]).head(10).iterrows():
+            print(
+                f"{row['date'].date()}: {row['home_team']} {row['home_score']}-{row['away_score']} "
+                f"predicted {row['predicted_home_goals']}-{row['predicted_away_goals']} "
+                f"(correct_outcome={row['correct_outcome']})"
+            )
     else:
         predictions, group_table = simulate_group_stage(
             matches,
