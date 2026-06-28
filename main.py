@@ -66,7 +66,8 @@ DRAW_DECAY = 0.12
 GOAL_SCALING_FACTOR = 1.47
 HOME_ADVANTAGE = 0.08
 HISTORICAL_HOME_GOAL_ADJUSTMENT = 0.18
-HISTORY_STRENGTH_SCALE = 100.0
+HISTORY_STRENGTH_SCALE = 50.0
+GOAL_CAP = 5
 
 
 def normalize_team_name(team: str) -> str:
@@ -99,16 +100,31 @@ def infer_host_country(ground: str) -> str | None:
     return None
 
 
-def load_group_matches(path: Path | str = DATA_DIR / "worldcup.json") -> pd.DataFrame:
-    """Load the World Cup group-stage schedule."""
+def load_matches(
+    path: Path | str = DATA_DIR / "worldcup.json", round_contains: str | None = None
+) -> pd.DataFrame:
+    """Load matches from the World Cup JSON; optionally filter by substring in the `round` field."""
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
 
-    matches = pd.DataFrame(payload["matches"])
+    matches = pd.DataFrame(payload.get("matches", []))
+    if matches.empty:
+        return matches
+
     matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
-    matches = matches[matches["round"].str.contains("Matchday", na=False)].copy()
+    if round_contains:
+        matches = matches[
+            matches["round"].str.contains(round_contains, na=False)
+        ].copy()
+    else:
+        matches = matches.copy()
     matches["host_country"] = matches["ground"].apply(infer_host_country)
     return matches
+
+
+def load_group_matches(path: Path | str = DATA_DIR / "worldcup.json") -> pd.DataFrame:
+    """Backward-compatible wrapper to load group-stage matches."""
+    return load_matches(path=path, round_contains="Matchday")
 
 
 def build_rank_map(rankings: pd.DataFrame) -> dict[str, float]:
@@ -171,11 +187,16 @@ def historical_match_weight(
     row: pd.Series, rank_map: dict[str, float], reference_date: pd.Timestamp
 ) -> float:
     """Compute a combined weight for a historical match."""
-    return (
-        tournament_importance_weight(row["tournament"])
-        * match_recency_weight(row["date"], reference_date)
-        * ranking_similarity_weight(row["home_team"], row["away_team"], rank_map)
+    base = (
+        tournament_importance_weight(row.get("tournament", ""))
+        * match_recency_weight(row.get("date", pd.NaT), reference_date)
+        * ranking_similarity_weight(
+            row.get("home_team", ""), row.get("away_team", ""), rank_map
+        )
     )
+    # Allow injected rows (e.g. boosted group-stage results) to increase their influence
+    boost = float(row.get("injected_group_boost", 1.0))
+    return base * boost
 
 
 def build_historical_team_strengths(
@@ -387,6 +408,10 @@ def predict_match(
         team2_goals = max(1, round(expected_goals2))
         team1_goals = max(0, round(expected_goals1 * 0.65))
 
+    # Apply goal cap to avoid extreme deterministic blowouts
+    team1_goals = int(min(team1_goals, GOAL_CAP))
+    team2_goals = int(min(team2_goals, GOAL_CAP))
+
     if team1_goals > team2_goals:
         result = "team1"
     elif team1_goals < team2_goals:
@@ -473,6 +498,17 @@ def predict_match_stochastic(
         if team2_goals <= team1_goals:
             team2_goals = team1_goals + 1
 
+    # Apply goal cap to sampled results and recompute final result
+    team1_goals = int(min(team1_goals, GOAL_CAP))
+    team2_goals = int(min(team2_goals, GOAL_CAP))
+
+    if team1_goals > team2_goals:
+        result = "team1"
+    elif team1_goals < team2_goals:
+        result = "team2"
+    else:
+        result = "draw"
+
     return {
         "team1": team1,
         "team2": team2,
@@ -495,6 +531,8 @@ def simulate_group_stage(
     rank_map: dict[str, float],
     stochastic: bool = False,
     random_state: np.random.Generator | None = None,
+    use_group_results: bool = False,
+    group_weight_factor: float = 1.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Predict every group-stage match and simulate the resulting tables."""
     if stochastic and random_state is None:
@@ -506,6 +544,53 @@ def simulate_group_stage(
         if "date" in matches.columns and pd.notna(matches["date"].max())
         else pd.Timestamp("2026-06-01")
     )
+    # Optionally inject completed group-stage results (from worldcup.json)
+    if use_group_results:
+        group_matches = load_group_matches()
+
+        # Keep only matches that have a final score
+        def has_ft_score(s):
+            try:
+                return bool(s and isinstance(s.get("ft", None), list))
+            except Exception:
+                return False
+
+        injected = []
+        for _, gm in group_matches.iterrows():
+            if has_ft_score(gm.get("score", {})):
+                ft = gm["score"]["ft"]
+                injected.append(
+                    {
+                        "date": gm["date"],
+                        "tournament": "World Cup 2026",
+                        "home_team": gm["team1"],
+                        "away_team": gm["team2"],
+                        "home_score": int(ft[0]),
+                        "away_score": int(ft[1]),
+                        "injected_group_boost": float(group_weight_factor),
+                    }
+                )
+        if injected:
+            injected_df = pd.DataFrame.from_records(injected)
+            # Avoid duplicating matches that already exist in historical by date+teams
+            if not historical.empty:
+                merged = historical.merge(
+                    injected_df,
+                    left_on=["date", "home_team", "away_team"],
+                    right_on=["date", "home_team", "away_team"],
+                    how="left",
+                    indicator=True,
+                )
+                # Keep only historical rows that are not exact matches (to avoid duplicates)
+                historical = (
+                    merged[merged["_merge"] == "left_only"]
+                    .drop(columns=["_merge"])
+                    .reindex(columns=historical.columns)
+                )
+            historical = pd.concat(
+                [historical, injected_df], ignore_index=True, sort=False
+            )
+
     historical["weight"] = historical.apply(
         lambda row: historical_match_weight(row, rank_map, reference_date), axis=1
     )
@@ -606,6 +691,143 @@ def export_match_predictions(predictions: pd.DataFrame, path: Path) -> None:
     sorted_predictions.to_csv(path, index=False)
 
 
+def predict_knockout_round(
+    round_name: str,
+    rank_map: dict[str, float],
+    deterministic: bool = True,
+    use_group_results: bool = False,
+    group_weight_factor: float = 1.0,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """Predict matches for a knockout round (e.g., 'Round of 32').
+
+    Completed matches present in the JSON with a final `score.ft` are used as ground truth.
+    """
+    matches = load_matches(round_contains=round_name)
+    if matches.empty:
+        return pd.DataFrame()
+
+    # Prepare historical strengths and base goals (optionally injecting group results)
+    historical = pd.read_csv(DATA_DIR / "results.csv", parse_dates=["date"])
+    reference_date = (
+        matches["date"].max()
+        if pd.notna(matches["date"].max())
+        else pd.Timestamp("2026-06-01")
+    )
+
+    if use_group_results:
+        group_matches = load_group_matches()
+        injected = []
+
+        def has_ft_score(s):
+            try:
+                return bool(s and isinstance(s.get("ft", None), list))
+            except Exception:
+                return False
+
+        for _, gm in group_matches.iterrows():
+            if has_ft_score(gm.get("score", {})):
+                ft = gm["score"]["ft"]
+                injected.append(
+                    {
+                        "date": gm["date"],
+                        "tournament": "World Cup 2026",
+                        "home_team": gm["team1"],
+                        "away_team": gm["team2"],
+                        "home_score": int(ft[0]),
+                        "away_score": int(ft[1]),
+                        "injected_group_boost": float(group_weight_factor),
+                    }
+                )
+        if injected:
+            injected_df = pd.DataFrame.from_records(injected)
+            if not historical.empty:
+                merged = historical.merge(
+                    injected_df,
+                    left_on=["date", "home_team", "away_team"],
+                    right_on=["date", "home_team", "away_team"],
+                    how="left",
+                    indicator=True,
+                )
+                historical = (
+                    merged[merged["_merge"] == "left_only"]
+                    .drop(columns=["_merge"])
+                    .reindex(columns=historical.columns)
+                )
+            historical = pd.concat(
+                [historical, injected_df], ignore_index=True, sort=False
+            )
+
+    historical["weight"] = historical.apply(
+        lambda row: historical_match_weight(row, rank_map, reference_date), axis=1
+    )
+    historical_strength = build_historical_team_strengths(
+        historical, rank_map, reference_date
+    )
+    base_goal = compute_weighted_average_goals(historical, rank_map, reference_date)
+
+    rng = np.random.default_rng(seed) if seed is not None else None
+    predictions = []
+
+    for _, row in matches.iterrows():
+        actual_score = None
+        if isinstance(row.get("score"), dict) and isinstance(
+            row["score"].get("ft"), list
+        ):
+            ft = row["score"]["ft"]
+            actual_score = (int(ft[0]), int(ft[1]))
+
+        if actual_score is not None:
+            # compute probabilities but use actual goals
+            probs = predict_match(
+                row["team1"],
+                row["team2"],
+                rank_map,
+                row.get("ground", ""),
+                row.get("host_country"),
+                base_goal,
+                historical_strength,
+            )
+            probs["team1_goals"] = int(actual_score[0])
+            probs["team2_goals"] = int(actual_score[1])
+            if probs["team1_goals"] > probs["team2_goals"]:
+                probs["result"] = "team1"
+            elif probs["team1_goals"] < probs["team2_goals"]:
+                probs["result"] = "team2"
+            else:
+                probs["result"] = "draw"
+            prediction = probs
+        else:
+            if deterministic:
+                prediction = predict_match(
+                    row["team1"],
+                    row["team2"],
+                    rank_map,
+                    row.get("ground", ""),
+                    row.get("host_country"),
+                    base_goal,
+                    historical_strength,
+                )
+            else:
+                prediction = predict_match_stochastic(
+                    row["team1"],
+                    row["team2"],
+                    rank_map,
+                    row.get("ground", ""),
+                    row.get("host_country"),
+                    base_goal,
+                    rng,
+                    historical_strength,
+                )
+
+        prediction["group"] = row.get("group")
+        prediction["round"] = row.get("round")
+        predictions.append(prediction)
+
+    prediction_frame = pd.DataFrame.from_records(predictions)
+    return prediction_frame
+
+
 def summarize_monte_carlo(
     matches: pd.DataFrame,
     rank_map: dict[str, float],
@@ -693,6 +915,23 @@ def main() -> None:
         help="Choose deterministic, stochastic, Monte Carlo, or backtest mode.",
     )
     parser.add_argument(
+        "--use-group-results",
+        action="store_true",
+        help="Use completed group-stage results from data/worldcup.json as ground truth and inject them into historical strengths.",
+    )
+    parser.add_argument(
+        "--group-weight-factor",
+        type=float,
+        default=1.0,
+        help="Multiplier to increase influence of injected group-stage results when building historical strengths.",
+    )
+    parser.add_argument(
+        "--predict-round",
+        type=str,
+        default=None,
+        help="If set, predict the specified knockout round (e.g., 'Round of 32') and export to a separate CSV.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -709,6 +948,28 @@ def main() -> None:
     rankings = load_rankings()
     rank_map = build_rank_map(rankings)
     matches = load_group_matches()
+
+    # If the user asked to predict a knockout round, do that first and exit
+    if args.predict_round:
+        deterministic = args.mode == "deterministic"
+        predictions = predict_knockout_round(
+            args.predict_round,
+            rank_map,
+            deterministic=deterministic,
+            use_group_results=args.use_group_results,
+            group_weight_factor=args.group_weight_factor,
+            seed=args.seed,
+        )
+        out_path = (
+            Path(__file__).resolve().parent
+            / f"predicted_{args.predict_round.replace(' ', '_').lower()}.csv"
+        )
+        if not predictions.empty:
+            export_match_predictions(predictions, out_path)
+            print(f"Wrote knockout predictions to {out_path}")
+        else:
+            print(f"No matches found for round '{args.predict_round}' in worldcup.json")
+        return
 
     if args.mode == "montecarlo":
         summary = summarize_monte_carlo(
@@ -754,6 +1015,8 @@ def main() -> None:
             random_state=(
                 np.random.default_rng(args.seed) if args.seed is not None else None
             ),
+            use_group_results=args.use_group_results,
+            group_weight_factor=args.group_weight_factor,
         )
 
         csv_path = (
