@@ -270,6 +270,29 @@ def compute_weighted_average_goals(
     return float(np.clip(average_goals, 1.20, 1.70))
 
 
+def apply_goal_dampening(team1_goals: float, team2_goals: float) -> tuple[int, int]:
+    """Dampen extreme goal predictions to be more realistic."""
+    # Reduce extreme scores to avoid unrealistic blowouts
+    # Shift extreme predictions toward more realistic outcomes
+    max_for_winner = 3.5
+    max_for_loser = 1.5
+
+    if team1_goals > team2_goals:
+        # team1 is winning, dampen excessive goals
+        if team1_goals > max_for_winner:
+            team1_goals = max(2, team1_goals - 1.0)
+        if team2_goals > max_for_loser:
+            team2_goals = max(0, team2_goals - 0.5)
+    elif team2_goals > team1_goals:
+        # team2 is winning
+        if team2_goals > max_for_winner:
+            team2_goals = max(2, team2_goals - 1.0)
+        if team1_goals > max_for_loser:
+            team1_goals = max(0, team1_goals - 0.5)
+
+    return round(team1_goals), round(team2_goals)
+
+
 def backtest_last_year(
     rank_map: dict[str, float],
     days: int = 365,
@@ -412,6 +435,9 @@ def predict_match(
     team1_goals = int(min(team1_goals, GOAL_CAP))
     team2_goals = int(min(team2_goals, GOAL_CAP))
 
+    # Apply dampening to reduce unrealistic extreme scorelines
+    team1_goals, team2_goals = apply_goal_dampening(team1_goals, team2_goals)
+
     if team1_goals > team2_goals:
         result = "team1"
     elif team1_goals < team2_goals:
@@ -501,6 +527,9 @@ def predict_match_stochastic(
     # Apply goal cap to sampled results and recompute final result
     team1_goals = int(min(team1_goals, GOAL_CAP))
     team2_goals = int(min(team2_goals, GOAL_CAP))
+
+    # Apply dampening to reduce unrealistic extreme scorelines
+    team1_goals, team2_goals = apply_goal_dampening(team1_goals, team2_goals)
 
     if team1_goals > team2_goals:
         result = "team1"
