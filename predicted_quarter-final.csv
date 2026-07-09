@@ -1,0 +1,5 @@
+team1,team2,group,ground,team1_goals,team2_goals,prob_team1,prob_draw,prob_team2,result,rating1,rating2,host_country,round
+Argentina,Switzerland,,Kansas City,3,0,0.7132166090459411,0.20845993556979533,0.0783234553842636,team1,1877.266571,1650.064179,USA,Quarter-final
+France,Morocco,,Boston (Foxborough),2,2,0.6473933722892222,0.22224423357242504,0.13036239413835268,draw,1870.696162,1755.100232,USA,Quarter-final
+Norway,England,,Miami (Miami Gardens),0,3,0.07470038807201024,0.20747984732854222,0.7178197645994475,team2,1557.437664,1827.048678,USA,Quarter-final
+Spain,Belgium,,Los Angeles (Inglewood),2,2,0.6334317610790442,0.22517653749601865,0.14139170142493715,draw,1874.710778,1742.235945,USA,Quarter-final

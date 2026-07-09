@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -63,11 +64,14 @@ DEFAULT_RANK_POINTS = 1500.0
 RATING_SCALE = 420.0
 DRAW_BASE = 0.18
 DRAW_DECAY = 0.12
+DRAW_THRESHOLD_GROUP = 0.24
+DRAW_THRESHOLD_KNOCKOUT = 0.22
 GOAL_SCALING_FACTOR = 1.47
 HOME_ADVANTAGE = 0.08
 HISTORICAL_HOME_GOAL_ADJUSTMENT = 0.18
 HISTORY_STRENGTH_SCALE = 50.0
 GOAL_CAP = 5
+DEFAULT_GROUP_RESULT_WEIGHT = 3.0
 
 
 def normalize_team_name(team: str) -> str:
@@ -100,6 +104,47 @@ def infer_host_country(ground: str) -> str | None:
     return None
 
 
+def normalize_round_phrase(value: str | None) -> str:
+    """Normalize round names for fuzzy matching."""
+    if value is None:
+        return ""
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
+    normalized = normalized.replace("finals", "final")
+    normalized = normalized.replace("quarterfinal", "quarter final")
+    normalized = normalized.replace("quarter-finals", "quarter final")
+    normalized = normalized.replace("semi-final", "semi final")
+    normalized = normalized.replace("semifinal", "semi final")
+    normalized = normalized.replace("match day", "matchday")
+    normalized = normalized.replace("matchdays", "matchday")
+    return normalized
+
+
+def is_knockout_round(round_name: str | None) -> bool:
+    """Return True if the round name indicates a knockout stage."""
+    normalized = normalize_round_phrase(round_name)
+    return bool(
+        any(
+            token in normalized
+            for token in [
+                "round of",
+                "quarter",
+                "semi",
+                "final",
+                "third place",
+            ]
+        )
+        and "matchday" not in normalized
+    )
+
+
+def draw_threshold_for_round(round_name: str | None) -> float:
+    """Return a draw threshold appropriate for the match round."""
+    if is_knockout_round(round_name):
+        return DRAW_THRESHOLD_KNOCKOUT
+    return DRAW_THRESHOLD_GROUP
+
+
 def load_matches(
     path: Path | str = DATA_DIR / "worldcup.json", round_contains: str | None = None
 ) -> pd.DataFrame:
@@ -113,8 +158,11 @@ def load_matches(
 
     matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
     if round_contains:
+        normalized_target = normalize_round_phrase(round_contains)
         matches = matches[
-            matches["round"].str.contains(round_contains, na=False)
+            matches["round"]
+            .fillna("")
+            .apply(lambda r: normalized_target in normalize_round_phrase(r))
         ].copy()
     else:
         matches = matches.copy()
@@ -387,6 +435,8 @@ def predict_match(
     host_country: str | None,
     base_goal: float,
     historical_strength: dict[str, float] | None = None,
+    allow_draw: bool = True,
+    round_name: str | None = None,
 ) -> dict:
     """Predict the scoreline and outcome probabilities for one match."""
     rating1 = rating_points_for(team1, rank_map)
@@ -421,7 +471,8 @@ def predict_match(
         (-adjusted_diff / RATING_SCALE) - host_adjustment
     )
 
-    if p_draw >= 0.30:
+    draw_threshold = draw_threshold_for_round(round_name)
+    if allow_draw and p_draw >= draw_threshold:
         score = max(0, round((expected_goals1 + expected_goals2) / 2.0))
         team1_goals = team2_goals = score
     elif p_team1 > p_team2:
@@ -560,8 +611,8 @@ def simulate_group_stage(
     rank_map: dict[str, float],
     stochastic: bool = False,
     random_state: np.random.Generator | None = None,
-    use_group_results: bool = False,
-    group_weight_factor: float = 1.0,
+    use_group_results: bool = True,
+    group_weight_factor: float = DEFAULT_GROUP_RESULT_WEIGHT,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Predict every group-stage match and simulate the resulting tables."""
     if stochastic and random_state is None:
@@ -724,8 +775,8 @@ def predict_knockout_round(
     round_name: str,
     rank_map: dict[str, float],
     deterministic: bool = True,
-    use_group_results: bool = False,
-    group_weight_factor: float = 1.0,
+    use_group_results: bool = True,
+    group_weight_factor: float = DEFAULT_GROUP_RESULT_WEIGHT,
     seed: int | None = None,
 ) -> pd.DataFrame:
     """Predict matches for a knockout round (e.g., 'Round of 32').
@@ -816,6 +867,7 @@ def predict_knockout_round(
                 row.get("host_country"),
                 base_goal,
                 historical_strength,
+                allow_draw=False,
             )
             probs["team1_goals"] = int(actual_score[0])
             probs["team2_goals"] = int(actual_score[1])
@@ -836,6 +888,7 @@ def predict_knockout_round(
                     row.get("host_country"),
                     base_goal,
                     historical_strength,
+                    round_name=row.get("round"),
                 )
             else:
                 prediction = predict_match_stochastic(
@@ -945,14 +998,31 @@ def main() -> None:
     )
     parser.add_argument(
         "--use-group-results",
+        dest="use_group_results",
         action="store_true",
-        help="Use completed group-stage results from data/worldcup.json as ground truth and inject them into historical strengths.",
+        default=True,
+        help=(
+            "Use completed group-stage results from data/worldcup.json as ground truth "
+            "and inject them into historical strengths. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-use-group-results",
+        dest="use_group_results",
+        action="store_false",
+        help=(
+            "Do not use completed group-stage results from data/worldcup.json when "
+            "building historical strengths."
+        ),
     )
     parser.add_argument(
         "--group-weight-factor",
         type=float,
-        default=1.0,
-        help="Multiplier to increase influence of injected group-stage results when building historical strengths.",
+        default=DEFAULT_GROUP_RESULT_WEIGHT,
+        help=(
+            "Multiplier to increase influence of injected group-stage results when building "
+            "historical strengths. Defaults to increased group-stage weight."
+        ),
     )
     parser.add_argument(
         "--predict-round",
