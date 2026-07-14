@@ -1,0 +1,3 @@
+team1,team2,group,ground,team1_goals,team2_goals,prob_team1,prob_draw,prob_team2,result,rating1,rating2,host_country,round
+England,Argentina,,Atlanta,1,2,0.2619746264208503,0.2612389458643234,0.4767864277148264,team2,1827.048678,1877.266571,USA,Semi-final
+France,Spain,,Dallas (Arlington),2,1,0.4171803375171141,0.27784637915698784,0.30497328332589807,team1,1870.696162,1874.710778,USA,Semi-final
