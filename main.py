@@ -1131,7 +1131,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["deterministic", "stochastic", "montecarlo", "backtest", "worldcup-backtest"],
+        choices=[
+            "deterministic",
+            "stochastic",
+            "montecarlo",
+            "backtest",
+            "worldcup-backtest",
+        ],
         default="deterministic",
         help="Choose deterministic, stochastic, Monte Carlo, backtest, or worldcup-backtest mode.",
     )
