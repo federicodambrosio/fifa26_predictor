@@ -120,6 +120,17 @@ def normalize_round_phrase(value: str | None) -> str:
     return normalized
 
 
+def round_matches_target(round_name: str | None, target: str | None) -> bool:
+    """Return True when a round name matches the requested round target."""
+    normalized_round = normalize_round_phrase(round_name)
+    normalized_target = normalize_round_phrase(target)
+
+    if normalized_target == "final":
+        return "final" in normalized_round or "third place" in normalized_round
+
+    return normalized_target in normalized_round
+
+
 def is_knockout_round(round_name: str | None) -> bool:
     """Return True if the round name indicates a knockout stage."""
     normalized = normalize_round_phrase(round_name)
@@ -158,11 +169,10 @@ def load_matches(
 
     matches["date"] = pd.to_datetime(matches["date"], errors="coerce")
     if round_contains:
-        normalized_target = normalize_round_phrase(round_contains)
         matches = matches[
             matches["round"]
             .fillna("")
-            .apply(lambda r: normalized_target in normalize_round_phrase(r))
+            .apply(lambda r: round_matches_target(r, round_contains))
         ].copy()
     else:
         matches = matches.copy()
