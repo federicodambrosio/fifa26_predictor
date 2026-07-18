@@ -1,8 +1,9 @@
 [project]
 name = "fifa26"
 version = "0.1.0"
-description = "Add your description here"
+description = "A vibecoded FIFA World Cup 2026 predictor for fun in a company prediction league"
 readme = "README.md"
+license = { text = "GPL-3.0-only" }
 requires-python = ">=3.14"
 dependencies = [
     "ipykernel>=7.3.0",
