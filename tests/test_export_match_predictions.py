@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -6,7 +7,40 @@ import pandas as pd
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from main import export_match_predictions
+from main import export_match_predictions, load_matches
+
+
+def test_load_matches_includes_third_place_when_requesting_final_round(
+    tmp_path: Path,
+) -> None:
+    worldcup_path = tmp_path / "worldcup.json"
+    worldcup_data = {
+        "matches": [
+            {
+                "round": "Final",
+                "date": "2026-07-18",
+                "team1": "Spain",
+                "team2": "Argentina",
+                "ground": "New York/New Jersey (East Rutherford)",
+            },
+            {
+                "round": "Match for third place",
+                "date": "2026-07-17",
+                "team1": "France",
+                "team2": "England",
+                "ground": "Miami",
+            },
+        ]
+    }
+    worldcup_path.write_text(json.dumps(worldcup_data), encoding="utf-8")
+
+    matches = load_matches(worldcup_path, round_contains="Final")
+
+    assert len(matches) == 2
+    assert {row["round"] for _, row in matches.iterrows()} == {
+        "Final",
+        "Match for third place",
+    }
 
 
 def test_export_match_predictions_sorts_by_match_datetime(tmp_path: Path) -> None:
