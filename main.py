@@ -704,6 +704,7 @@ def simulate_group_stage(
             )
         prediction["group"] = row["group"]
         prediction["round"] = row["round"]
+        prediction["date"] = row.get("date", pd.NaT)
         predictions.append(prediction)
 
     prediction_frame = pd.DataFrame(predictions)
@@ -766,8 +767,19 @@ def simulate_group_stage(
 
 
 def export_match_predictions(predictions: pd.DataFrame, path: Path) -> None:
-    """Export all match predictions to a CSV file."""
-    sorted_predictions = predictions.sort_values(["group", "round", "team1"])
+    """Export all match predictions to a CSV file in chronological order."""
+    export_frame = predictions.copy()
+    if "date" in export_frame.columns:
+        export_frame["date"] = pd.to_datetime(export_frame["date"], errors="coerce")
+
+    sort_columns = []
+    if "date" in export_frame.columns:
+        sort_columns.append("date")
+    sort_columns.extend(["group", "round", "team1"])
+
+    sorted_predictions = export_frame.sort_values(
+        sort_columns, ascending=[True] + [True, True, True], na_position="last"
+    )
     sorted_predictions.to_csv(path, index=False)
 
 
@@ -904,6 +916,7 @@ def predict_knockout_round(
 
         prediction["group"] = row.get("group")
         prediction["round"] = row.get("round")
+        prediction["date"] = row.get("date", pd.NaT)
         predictions.append(prediction)
 
     prediction_frame = pd.DataFrame.from_records(predictions)
