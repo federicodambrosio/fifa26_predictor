@@ -427,6 +427,132 @@ def backtest_last_year(
     return results, metrics
 
 
+def backtest_worldcup(
+    rank_map: dict[str, float],
+    worldcup_path: Path | str = DATA_DIR / "worldcup.json",
+    results_path: Path | str = DATA_DIR / "results.csv",
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """Backtest the model on World Cup 2026 matches against actual results."""
+    # Load historical data for training
+    historical = pd.read_csv(results_path, parse_dates=["date"])
+    if historical.empty:
+        raise ValueError("Historical results are empty; cannot run backtest.")
+
+    # Use all historical data for training (no temporal split for backtest)
+    reference_date = historical["date"].max()
+    historical_strength = build_historical_team_strengths(
+        historical, rank_map, reference_date
+    )
+    base_goal = compute_weighted_average_goals(historical, rank_map, reference_date)
+
+    # Load World Cup matches
+    with open(worldcup_path, encoding="utf-8") as handle:
+        worldcup_data = json.load(handle)
+
+    matches = []
+    for match in worldcup_data.get("matches", []):
+        # Extract actual score from the match data
+        score_ft = match.get("score", {}).get("ft", [None, None])
+        if score_ft == [None, None] or None in score_ft:
+            continue
+
+        # Create match record
+        match_record = {
+            "date": pd.to_datetime(match.get("date"), errors="coerce"),
+            "team1": match.get("team1"),
+            "team2": match.get("team2"),
+            "actual_team1_goals": int(score_ft[0]),
+            "actual_team2_goals": int(score_ft[1]),
+            "group": match.get("group"),
+            "round": match.get("round"),
+            "ground": match.get("ground", ""),
+        }
+        matches.append(match_record)
+
+    if not matches:
+        raise ValueError("No complete matches found in World Cup data for backtesting.")
+
+    matches_df = pd.DataFrame(matches)
+
+    # Generate predictions for each match
+    rows = []
+    for _, row in matches_df.iterrows():
+        host_country = infer_host_country(row["ground"])
+
+        prediction = predict_match(
+            row["team1"],
+            row["team2"],
+            rank_map,
+            row["ground"],
+            host_country,
+            base_goal,
+            historical_strength,
+            round_name=row["round"],
+        )
+
+        # Determine actual result
+        actual_team1_goals = row["actual_team1_goals"]
+        actual_team2_goals = row["actual_team2_goals"]
+        if actual_team1_goals > actual_team2_goals:
+            actual_result = "team1"
+        elif actual_team1_goals < actual_team2_goals:
+            actual_result = "team2"
+        else:
+            actual_result = "draw"
+
+        # Calculate errors
+        goal_diff_error = abs(
+            (prediction["team1_goals"] - prediction["team2_goals"])
+            - (actual_team1_goals - actual_team2_goals)
+        )
+
+        rows.append(
+            {
+                "date": row["date"],
+                "team1": row["team1"],
+                "team2": row["team2"],
+                "group": row["group"],
+                "round": row["round"],
+                "ground": row["ground"],
+                "actual_team1_goals": actual_team1_goals,
+                "actual_team2_goals": actual_team2_goals,
+                "predicted_team1_goals": prediction["team1_goals"],
+                "predicted_team2_goals": prediction["team2_goals"],
+                "predicted_result": prediction["result"],
+                "actual_result": actual_result,
+                "prob_team1": prediction["prob_team1"],
+                "prob_draw": prediction["prob_draw"],
+                "prob_team2": prediction["prob_team2"],
+                "correct_outcome": prediction["result"] == actual_result,
+                "exact_score": (
+                    prediction["team1_goals"] == actual_team1_goals
+                    and prediction["team2_goals"] == actual_team2_goals
+                ),
+                "goal_diff_error": float(goal_diff_error),
+            }
+        )
+
+    results = pd.DataFrame.from_records(rows)
+    metrics = {
+        "matches": len(results),
+        "outcome_accuracy": float(results["correct_outcome"].mean()),
+        "exact_score_accuracy": float(results["exact_score"].mean()),
+        "mean_absolute_goal_diff_error": float(results["goal_diff_error"].mean()),
+        "group_stage_accuracy": float(
+            results[results["round"].str.contains("Matchday", na=False)][
+                "correct_outcome"
+            ].mean()
+        ),
+        "knockout_accuracy": float(
+            results[~results["round"].str.contains("Matchday", na=False)][
+                "correct_outcome"
+            ].mean()
+        ),
+    }
+
+    return results, metrics
+
+
 def predict_match(
     team1: str,
     team2: str,
@@ -1005,9 +1131,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["deterministic", "stochastic", "montecarlo", "backtest"],
+        choices=["deterministic", "stochastic", "montecarlo", "backtest", "worldcup-backtest"],
         default="deterministic",
-        help="Choose deterministic, stochastic, Monte Carlo, or backtest mode.",
+        help="Choose deterministic, stochastic, Monte Carlo, backtest, or worldcup-backtest mode.",
     )
     parser.add_argument(
         "--use-group-results",
@@ -1118,6 +1244,27 @@ def main() -> None:
                 f"{row['date'].date()}: {row['home_team']} {row['home_score']}-{row['away_score']} "
                 f"predicted {row['predicted_home_goals']}-{row['predicted_away_goals']} "
                 f"(correct_outcome={row['correct_outcome']})"
+            )
+    elif args.mode == "worldcup-backtest":
+        results, metrics = backtest_worldcup(rank_map)
+        csv_path = Path(__file__).resolve().parent / "worldcup_backtest_results.csv"
+        results.to_csv(csv_path, index=False)
+        print(f"Wrote World Cup backtest results to {csv_path}")
+        print("\n=== World Cup 2026 Backtest Metrics ===")
+        print(f"Total matches: {metrics['matches']}")
+        print(f"Outcome accuracy: {metrics['outcome_accuracy']:.3f}")
+        print(f"Exact score accuracy: {metrics['exact_score_accuracy']:.3f}")
+        print(
+            f"Mean absolute goal difference error: {metrics['mean_absolute_goal_diff_error']:.3f}"
+        )
+        print(f"Group stage accuracy: {metrics['group_stage_accuracy']:.3f}")
+        print(f"Knockout accuracy: {metrics['knockout_accuracy']:.3f}")
+        print("\n=== Sample backtest rows ===")
+        for _, row in results.sort_values(["date"]).head(10).iterrows():
+            print(
+                f"{row['date'].date()}: {row['team1']} {row['actual_team1_goals']}-{row['actual_team2_goals']} {row['team2']} "
+                f"({row['round']}) | Predicted: {row['predicted_team1_goals']}-{row['predicted_team2_goals']} | "
+                f"Correct: {row['correct_outcome']} | Prob: {row['prob_team1']:.2f}/{row['prob_draw']:.2f}/{row['prob_team2']:.2f}"
             )
     else:
         predictions, group_table = simulate_group_stage(
